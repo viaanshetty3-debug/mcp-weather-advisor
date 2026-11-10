@@ -1,6 +1,6 @@
 # MCP Weather & Transit Advisor
 
-[![Tests](https://github.com/<your-username>/mcp-weather-advisor/actions/workflows/tests.yml/badge.svg)](https://github.com/<your-username>/mcp-weather-advisor/actions/workflows/tests.yml)
+[![Tests](https://github.com/viaanshetty3-debug/mcp-weather-advisor/actions/workflows/tests.yml/badge.svg)](https://github.com/viaanshetty3-debug/mcp-weather-advisor/actions/workflows/tests.yml)
 
 A small [Model Context Protocol](https://modelcontextprotocol.io) server that lets Claude check real-time weather and plan real public-transport trips, then recommend a route that suits the weather.
 
@@ -57,7 +57,7 @@ A virtual environment (`.venv`) is a private Python install for this project. Cr
 
 **macOS / Linux**
 ```bash
-git clone https://github.com/<your-username>/mcp-weather-advisor.git
+git clone https://github.com/viaanshetty3-debug/mcp-weather-advisor.git
 cd mcp-weather-advisor
 python3 -m venv .venv
 source .venv/bin/activate
@@ -66,7 +66,7 @@ pip install -e .
 
 **Windows (PowerShell)**
 ```powershell
-git clone https://github.com/<your-username>/mcp-weather-advisor.git
+git clone https://github.com/viaanshetty3-debug/mcp-weather-advisor.git
 cd mcp-weather-advisor
 python -m venv .venv
 .venv\Scripts\Activate.ps1
@@ -294,8 +294,6 @@ The suite (~255 tests, about 90 seconds) needs no internet and no API keys:
 3. runs **everything else**: the MCP stdio tool tests, API-failure handling, logging, packaging and unit tests. This step runs even if the cache step failed, so all problems show up in one run.
 
 If anything fails, the run keeps a downloadable artifact with JUnit reports plus each test's server stderr and `mcp_server.log`. No secrets are needed: the tests use a local fake API.
-
-Replace `<your-username>` in the badge at the top of this README once the repository is on GitHub.
 
 ## Troubleshooting
 
