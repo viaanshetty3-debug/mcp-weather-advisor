@@ -6,3 +6,4 @@ venv/
 ENV/
 .env
 .DS_Store
+cache.sqlite3*

@@ -23,8 +23,12 @@ Run it with:  python server.py
 (Claude Desktop starts it for you - see README.md.)
 """
 
+import json
 import os
+import sqlite3
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -52,8 +56,26 @@ HEADERS = {"User-Agent": "mcp-weather-transit-advisor/0.2"}
 # Never wait forever on a network call.
 TIMEOUT_SECONDS = 20.0
 
-# How many trip options to show.
+# How many trip options to show. We ask the router for a few more so that a
+# cached plan still has options left after already-departed trips are removed.
 MAX_ITINERARIES = 3
+ITINERARIES_TO_FETCH = 6
+
+# How many departures to request per stop. Fixed (not the user's limit) so
+# all requests for one stop share a single cache entry.
+DEPARTURES_TO_FETCH = 20
+
+# ---- Cache settings --------------------------------------------------------
+# Answers are stored in a local SQLite file so repeated questions within the
+# time-to-live (TTL) are served without calling the API again.
+# Set WEATHER_ADVISOR_CACHE to choose another file, or to "off" to disable.
+CACHE_PATH = os.environ.get(
+    "WEATHER_ADVISOR_CACHE", str(Path(__file__).with_name("cache.sqlite3"))
+)
+WEATHER_TTL = 15 * 60           # weather changes slowly: 15 minutes
+TRANSIT_TTL = 15 * 60           # timetables: 15 min (departed trips removed)
+LIVE_ARRIVALS_TTL = 60          # live bus ETAs go stale fast: 1 minute
+GEOCODE_TTL = 7 * 24 * 60 * 60  # place coordinates rarely change: 7 days
 
 # Open-Meteo reports weather as numeric "WMO codes". This maps them to words.
 WEATHER_CODES = {
@@ -95,22 +117,144 @@ MODE_NAMES = {
 
 
 # --------------------------------------------------------------------------
-# 2. Helper functions (plain Python, not exposed to Claude)
+# 2a. SQLite cache
+#     A tiny key -> JSON store. The key is the URL plus its query
+#     parameters, so the same question always maps to the same row.
+#     Any cache problem (locked file, read-only disk...) is treated as a
+#     cache miss, so the cache can never break a tool.
 # --------------------------------------------------------------------------
-async def _get_json(url: str, params: dict, headers: dict | None = None):
-    """Call an API and return its JSON. Raises a clear error on failure."""
+_cache_db: sqlite3.Connection | None = None
+
+
+def _cache() -> sqlite3.Connection | None:
+    """Open (once) and return the cache database, or None if disabled."""
+    global _cache_db
+    if CACHE_PATH.lower() == "off":
+        return None
+    if _cache_db is None:
+        try:
+            _cache_db = sqlite3.connect(CACHE_PATH)
+            _cache_db.execute(
+                "CREATE TABLE IF NOT EXISTS responses ("
+                " key TEXT PRIMARY KEY,"
+                " body TEXT NOT NULL,"         # the API's JSON answer
+                " fetched_at REAL NOT NULL,"   # when we got it (unix time)
+                " expires_at REAL NOT NULL)"   # when it stops being valid
+            )
+            _cache_db.commit()
+        except sqlite3.Error:
+            _cache_db = None
+    return _cache_db
+
+
+def _cache_key(url: str, params: dict) -> str:
+    """Build a stable key. Headers are NOT included, so API keys are never
+    written to disk."""
+    return url + "?" + json.dumps(params, sort_keys=True)
+
+
+def _cache_read(key: str):
+    """Return (data, age_in_seconds) for a still-valid entry, else None."""
+    db = _cache()
+    if db is None:
+        return None
+    try:
+        row = db.execute(
+            "SELECT body, fetched_at FROM responses "
+            "WHERE key = ? AND expires_at > ?",
+            (key, time.time()),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return json.loads(row[0]), time.time() - row[1]
+
+
+def _cache_write(key: str, data, ttl: float) -> None:
+    """Store an answer for `ttl` seconds and tidy up expired rows."""
+    db = _cache()
+    if db is None:
+        return
+    now = time.time()
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO responses VALUES (?, ?, ?, ?)",
+            (key, json.dumps(data), now, now + ttl),
+        )
+        db.execute("DELETE FROM responses WHERE expires_at <= ?", (now,))
+        db.commit()
+    except sqlite3.Error:
+        pass
+
+
+# --------------------------------------------------------------------------
+# 2b. Helper functions (plain Python, not exposed to Claude)
+# --------------------------------------------------------------------------
+async def _fetch_json(
+    url: str,
+    params: dict,
+    headers: dict | None = None,
+    ttl: float = 0,
+    fresh: bool = False,
+):
+    """Call an API (or the cache) and return (data, age_in_seconds).
+
+    ttl:   seconds to keep the answer in the cache (0 = don't cache).
+    fresh: True skips the cache read and always calls the API.
+    age is 0 for a brand-new answer.
+    """
+    key = _cache_key(url, params)
+    if ttl and not fresh:
+        hit = _cache_read(key)
+        if hit is not None:
+            return hit
+
     async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
         response = await client.get(
             url, params=params, headers={**HEADERS, **(headers or {})}
         )
         response.raise_for_status()  # turns HTTP 4xx/5xx into exceptions
-        return response.json()
+        data = response.json()
+
+    if ttl:
+        _cache_write(key, data, ttl)
+    return data, 0.0
+
+
+async def _get_json(url: str, params: dict, **kwargs):
+    """Like _fetch_json, but returns only the data."""
+    data, _age = await _fetch_json(url, params, **kwargs)
+    return data
+
+
+def _normalise(text: str) -> str:
+    """'  New   York ' -> 'new york', so near-identical queries share a cache
+    entry. Geocoders ignore case, so this doesn't change the answer."""
+    return " ".join(text.split()).lower()
+
+
+def _freshness(age: float) -> str:
+    """Note added to answers that came from the cache."""
+    if age <= 0:
+        return ""
+    minutes = int(age // 60)
+    return (f"\n(Served from cache, fetched "
+            f"{'<1' if minutes == 0 else minutes} min ago.)")
+
+
+def _is_future(iso_string: str) -> bool:
+    """True if an ISO timestamp is still in the future."""
+    moment = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+    return moment > datetime.now(timezone.utc)
 
 
 async def _find_place(name: str) -> dict:
     """Look up a CITY/TOWN name with Open-Meteo. Raises ValueError if none."""
     data = await _get_json(
-        GEOCODING_URL, {"name": name, "count": 1, "language": "en"}
+        GEOCODING_URL,
+        {"name": _normalise(name), "count": 1, "language": "en"},
+        ttl=GEOCODE_TTL,
     )
     results = data.get("results")
     if not results:
@@ -125,7 +269,11 @@ async def _find_transit_place(text: str, stops_only: bool = False) -> dict:
     With stops_only=True, returns the best match that is a transit stop.
     Raises ValueError if nothing suitable is found.
     """
-    results = await _get_json(f"{TRANSITOUS_URL}/v1/geocode", {"text": text})
+    results = await _get_json(
+        f"{TRANSITOUS_URL}/v1/geocode",
+        {"text": _normalise(text)},
+        ttl=GEOCODE_TTL,
+    )
     if stops_only:
         results = [r for r in results if r.get("type") == "STOP"]
     if not results:
@@ -137,9 +285,12 @@ async def _find_transit_place(text: str, stops_only: bool = False) -> dict:
     return results[0]
 
 
-async def _fetch_weather(latitude: float, longitude: float) -> dict:
-    """Fetch current conditions for a coordinate pair."""
-    return await _get_json(
+async def _fetch_weather(latitude: float, longitude: float):
+    """Fetch current conditions for a coordinate pair.
+
+    Returns (weather, age_in_seconds); cached for WEATHER_TTL.
+    """
+    return await _fetch_json(
         FORECAST_URL,
         {
             "latitude": latitude,
@@ -150,6 +301,7 @@ async def _fetch_weather(latitude: float, longitude: float) -> dict:
             ),
             "timezone": "auto",
         },
+        ttl=WEATHER_TTL,
     )
 
 
@@ -281,7 +433,8 @@ async def get_current_weather(place: str) -> str:
     """
     try:
         found = await _find_place(place)
-        weather = await _fetch_weather(found["latitude"], found["longitude"])
+        weather, age = await _fetch_weather(
+            found["latitude"], found["longitude"])
     except (ValueError, httpx.HTTPError) as err:
         return f"Could not get weather for '{place}': {err}"
 
@@ -299,6 +452,7 @@ async def get_current_weather(place: str) -> str:
         f"Precipitation: {now['precipitation']} {units['precipitation']}\n"
         f"Wind: {now['wind_speed_10m']} {units['wind_speed_10m']} "
         f"(gusts {now['wind_gusts_10m']} {units['wind_gusts_10m']})"
+        f"{_freshness(age)}"
     )
 
 
@@ -318,21 +472,30 @@ async def get_commute_advice(origin: str, destination: str) -> str:
     try:
         start = await _find_transit_place(origin)
         end = await _find_transit_place(destination)
-        weather = await _fetch_weather(start["lat"], start["lon"])
-        plan = await _get_json(
-            f"{TRANSITOUS_URL}/v5/plan",
-            {
-                "fromPlace": f"{start['lat']},{start['lon']}",
-                "toPlace": f"{end['lat']},{end['lon']}",
-                "numItineraries": MAX_ITINERARIES,
-            },
-        )
+        weather, weather_age = await _fetch_weather(start["lat"], start["lon"])
+
+        plan_params = {
+            "fromPlace": f"{start['lat']},{start['lon']}",
+            "toPlace": f"{end['lat']},{end['lon']}",
+            "numItineraries": ITINERARIES_TO_FETCH,
+        }
+        plan, plan_age = await _fetch_json(
+            f"{TRANSITOUS_URL}/v5/plan", plan_params, ttl=TRANSIT_TTL)
+        # A cached plan may contain trips that have already left.
+        upcoming = [it for it in plan.get("itineraries", [])
+                    if _is_future(it["startTime"])]
+        if plan_age and not upcoming:
+            # Every cached trip has departed: ask the router again.
+            plan, plan_age = await _fetch_json(
+                f"{TRANSITOUS_URL}/v5/plan", plan_params,
+                ttl=TRANSIT_TTL, fresh=True)
+            upcoming = plan.get("itineraries", [])
     except (ValueError, httpx.HTTPError) as err:
         return f"Could not plan a trip from '{origin}' to '{destination}': {err}"
 
     tz_name = weather.get("timezone")
     assessment = _assess_weather(weather["current"])
-    itineraries = plan.get("itineraries", [])[:MAX_ITINERARIES]
+    itineraries = upcoming[:MAX_ITINERARIES]
 
     lines = [
         f"Trip: {start['name']} -> {end['name']}",
@@ -369,7 +532,10 @@ async def get_commute_advice(origin: str, destination: str) -> str:
 
     lines.append("\n(Transit data: Transitous / open GTFS feeds. "
                  "'scheduled' times are timetabled, not live.)")
-    return "\n".join(lines)
+    # Report the oldest cached part (if any). Departed trips were removed
+    # above, but live delays in a cached plan may be out of date.
+    lines.append(_freshness(max(weather_age, plan_age)).strip())
+    return "\n".join(lines).rstrip()
 
 
 @mcp.tool()
@@ -391,15 +557,19 @@ async def get_stop_departures(stop: str, limit: int = 8) -> str:
     # --- Live path: Singapore LTA DataMall --------------------------------
     if is_sg_code and LTA_ACCOUNT_KEY:
         try:
-            data = await _get_json(
+            # Live ETAs are cached for only LIVE_ARRIVALS_TTL (1 minute).
+            # Minutes-to-arrival are recomputed from the absolute ETA each
+            # time, so a cached answer still counts down correctly.
+            data, age = await _fetch_json(
                 LTA_BUS_ARRIVAL_URL,
                 {"BusStopCode": stop},
                 headers={"AccountKey": LTA_ACCOUNT_KEY,
                          "accept": "application/json"},
+                ttl=LIVE_ARRIVALS_TTL,
             )
         except httpx.HTTPError as err:
             return f"LTA DataMall request failed for stop {stop}: {err}"
-        return _format_lta_arrivals(stop, data, limit)
+        return _format_lta_arrivals(stop, data, limit) + _freshness(age)
 
     # --- Timetable path: Transitous ---------------------------------------
     try:
@@ -408,14 +578,20 @@ async def get_stop_departures(stop: str, limit: int = 8) -> str:
         else:
             found = await _find_transit_place(stop, stops_only=True)
             stop_id = found["id"]
-        data = await _get_json(
-            f"{TRANSITOUS_URL}/v5/stoptimes", {"stopId": stop_id, "n": limit}
-        )
+        params = {"stopId": stop_id, "n": DEPARTURES_TO_FETCH}
+        url = f"{TRANSITOUS_URL}/v5/stoptimes"
+        data, age = await _fetch_json(url, params, ttl=TRANSIT_TTL)
+        stop_times = _upcoming_departures(data)
+        if age and len(stop_times) < limit:
+            # Too many cached departures have already left: refresh.
+            data, age = await _fetch_json(url, params, ttl=TRANSIT_TTL,
+                                          fresh=True)
+            stop_times = _upcoming_departures(data)
     except (ValueError, httpx.HTTPError) as err:
         return f"Could not get departures for '{stop}': {err}"
 
     # Transitous treats 'n' as a target, not a cap, so trim to the limit.
-    stop_times = data.get("stopTimes", [])[:limit]
+    stop_times = stop_times[:limit]
     if not stop_times:
         return f"No upcoming departures found for '{stop}'."
 
@@ -431,7 +607,17 @@ async def get_stop_departures(stop: str, limit: int = 8) -> str:
         )
     if is_sg_code:
         lines.append("(Timetabled only. Set LTA_ACCOUNT_KEY for live arrivals.)")
-    return "\n".join(lines)
+    return "\n".join(lines) + _freshness(age)
+
+
+def _upcoming_departures(data: dict) -> list[dict]:
+    """Departures from a Transitous stoptimes answer that haven't left yet."""
+    upcoming = []
+    for st in data.get("stopTimes", []):
+        when = st["place"].get("departure") or st["place"].get("arrival")
+        if when and _is_future(when):
+            upcoming.append(st)
+    return upcoming
 
 
 def _format_lta_arrivals(stop: str, data: dict, limit: int) -> str:

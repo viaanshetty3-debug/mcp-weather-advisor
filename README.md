@@ -27,6 +27,22 @@ Transit coverage depends on which operators publish open data. Singapore, most o
 
 Without a key, `get_stop_departures` falls back to Transitous timetables for Singapore stop codes.
 
+## Caching
+
+API answers are cached in a local SQLite file (`cache.sqlite3`, next to `server.py`) so repeated questions are answered instantly and the free APIs aren't hammered. Cached answers end with *"(Served from cache, fetched N min ago.)"*.
+
+| Data | Kept for | Notes |
+|------|----------|-------|
+| Weather | 15 min | |
+| Trip plans and stop timetables | 15 min | Trips and departures that have already left are dropped before answering; if none are left, the API is asked again. |
+| Live LTA bus arrivals | 1 min | Live ETAs go stale quickly. Minutes-to-arrival are recomputed from the stored arrival time. |
+| Place lookups (geocoding) | 7 days | Coordinates don't change. |
+
+- Change the TTLs at the top of `server.py` (`WEATHER_TTL`, `TRANSIT_TTL`, ...).
+- `WEATHER_ADVISOR_CACHE=/path/to/file.sqlite3` stores the cache elsewhere; `WEATHER_ADVISOR_CACHE=off` disables it.
+- API keys are never written to the cache. If the cache file can't be opened, the server simply calls the APIs directly.
+- To clear the cache, delete `cache.sqlite3`.
+
 ## Setup (beginner-friendly)
 
 ### 1. Install Python 3.10 or newer
