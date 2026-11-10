@@ -9,3 +9,6 @@ ENV/
 cache.sqlite3*
 .pytest_cache/
 mcp_server.log*
+*.egg-info/
+build/
+dist/

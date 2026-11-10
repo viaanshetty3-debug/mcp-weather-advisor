@@ -1,2 +1,0 @@
-[console_scripts]
-mcp-weather-advisor = mcp_weather_advisor.server:main

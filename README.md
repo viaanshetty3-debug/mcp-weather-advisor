@@ -50,10 +50,24 @@ API answers are cached in a local SQLite file (`~/.mcp-weather-advisor/cache.sql
 - **Windows:** download from the same page and tick **"Add python.exe to PATH"** in the installer.
 - Check it worked: `python3 --version` (on Windows: `python --version`).
 
-### 2. Clone and install
+### 2. Clone the project and create a virtual environment
+A virtual environment (`.venv`) is a private Python install for this project. Create it **inside the project folder**: the Claude Desktop config below points at it.
+
+**macOS / Linux**
 ```bash
 git clone https://github.com/<your-username>/mcp-weather-advisor.git
 cd mcp-weather-advisor
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+**Windows (PowerShell)**
+```powershell
+git clone https://github.com/<your-username>/mcp-weather-advisor.git
+cd mcp-weather-advisor
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -e .
 ```
 
@@ -62,26 +76,15 @@ pip install -e .
 - installs the server as an *editable* package, so edits to the code take effect without reinstalling;
 - adds a **`mcp-weather-advisor`** command that starts the server.
 
-`pip` installs into whichever Python environment is active:
-
-- **A virtual environment (recommended):**
-  ```bash
-  python3 -m venv .venv
-  source .venv/bin/activate      # Windows: .venv\Scripts\activate
-  pip install -e .
-  ```
-- **Your whole system:** run `pip install -e .` outside any virtual environment. Some Pythons (Homebrew's, and many Linux distributions') refuse system-wide installs with an `externally-managed-environment` error. There, use a virtual environment, or [pipx](https://pipx.pypa.io): `pipx install -e .`.
+> **Installing without a virtual environment:** `pip install -e .` also works system-wide, but some Pythons (Homebrew's, and many Linux distributions') refuse with an `externally-managed-environment` error. There, use the virtual environment above, or [pipx](https://pipx.pypa.io): `pipx install -e .`.
 
 > **Intel Mac note:** `cryptography` (a dependency of `mcp`) stopped publishing Intel Mac wheels after version 48. `pyproject.toml` therefore keeps it below 49 on Intel Macs only, so the install doesn't try to compile it from source. Other platforms get the latest version.
 
-### 3. Run it
-Any of these start the server:
+### 3. Check it runs
 ```bash
-mcp-weather-advisor                # installed command
-python -m mcp_weather_advisor      # same thing
-python server.py                   # from the repository folder
+python server.py
 ```
-The server waits silently for Claude to talk to it over stdio (press `Ctrl+C` to stop).
+The server starts and waits silently for Claude to talk to it over stdio. That's expected; press `Ctrl+C` to stop. `mcp-weather-advisor` and `python -m mcp_weather_advisor` start the same server.
 
 To try the tools interactively in the MCP Inspector (needs Node.js and `pip install -e ".[dev]"`):
 ```bash
@@ -90,41 +93,128 @@ mcp dev mcp_weather_advisor/server.py
 
 ## Connect to Claude Desktop
 
-1. Open Claude Desktop, then **Settings → Developer → Edit Config**. This opens `claude_desktop_config.json`.
-2. Add the server below. Use the **absolute path** of the installed command, because Claude Desktop doesn't see your shell's `PATH`. To find it:
-   - macOS/Linux: `which mcp-weather-advisor`
-   - Windows: `where mcp-weather-advisor`
+Claude Desktop starts the server itself, using two **absolute paths** from its config file:
 
+| Config key | Points to | Example (macOS) |
+|------------|-----------|-----------------|
+| `command` | the Python **inside your `.venv`** | `/Users/alex/mcp-weather-advisor/.venv/bin/python` |
+| `args` | the `server.py` in the project's top folder | `/Users/alex/mcp-weather-advisor/server.py` |
+
+### Step 1: Get your exact block (recommended)
+With the virtual environment activated, run this **from the project folder** (macOS/Linux). It prints the block with your real paths filled in:
+
+```bash
+python -c 'import json, os, sys; print(json.dumps({"mcpServers": {"weather-transit-advisor": {"command": sys.executable, "args": [os.path.abspath("server.py")]}}}, indent=2))'
+```
+
+Or write it by hand. Find the project folder's absolute path with `pwd` (macOS/Linux) or `(Get-Location).Path` (Windows), then fill in one of the templates below.
+
+### Step 2: The configuration block
+
+**macOS / Linux** (replace `/Users/alex/mcp-weather-advisor` with your project folder):
 ```json
 {
   "mcpServers": {
     "weather-transit-advisor": {
-      "command": "/absolute/path/to/mcp-weather-advisor",
+      "command": "/Users/alex/mcp-weather-advisor/.venv/bin/python",
+      "args": [
+        "/Users/alex/mcp-weather-advisor/server.py"
+      ]
+    }
+  }
+}
+```
+
+**Windows** (replace `C:\\Users\\alex\\mcp-weather-advisor`, keeping the **double backslashes** that JSON requires):
+```json
+{
+  "mcpServers": {
+    "weather-transit-advisor": {
+      "command": "C:\\Users\\alex\\mcp-weather-advisor\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\alex\\mcp-weather-advisor\\server.py"
+      ]
+    }
+  }
+}
+```
+
+**Optional: live Singapore bus arrivals.** If you have an [LTA DataMall key](#optional-live-singapore-bus-arrivals), add an `env` block after `args`. Remember the comma after the closing `]`:
+```json
+{
+  "mcpServers": {
+    "weather-transit-advisor": {
+      "command": "/Users/alex/mcp-weather-advisor/.venv/bin/python",
+      "args": [
+        "/Users/alex/mcp-weather-advisor/server.py"
+      ],
       "env": {
-        "LTA_ACCOUNT_KEY": "your-lta-key-here"
+        "LTA_ACCOUNT_KEY": "paste-your-real-key-here"
       }
     }
   }
 }
 ```
-   The `env` block is optional. Delete it if you don't have an LTA key; otherwise a placeholder value will cause 401 errors for Singapore stop codes.
+Leave `env` out entirely if you don't have a key. A placeholder value causes 401 errors for Singapore stop codes.
 
-3. Fully quit and reopen Claude Desktop.
-4. Try asking:
+### Step 3: Paste it into Claude Desktop
+1. In Claude Desktop, open **Settings → Developer → Edit Config**. This opens `claude_desktop_config.json`:
+   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+2. Paste the block in:
+   - **If the file is empty or `{}`:** replace its contents with the block.
+   - **If it already has an `"mcpServers"` section:** don't paste a second one. Copy only the `"weather-transit-advisor": { ... }` entry into the existing `"mcpServers"` object, with a comma between it and the server before it:
+     ```json
+     {
+       "mcpServers": {
+         "some-other-server": { "command": "..." },
+         "weather-transit-advisor": {
+           "command": "/Users/alex/mcp-weather-advisor/.venv/bin/python",
+           "args": ["/Users/alex/mcp-weather-advisor/server.py"]
+         }
+       }
+     }
+     ```
+3. Save, then **fully quit Claude Desktop** (macOS: ⌘Q; Windows: right-click the tray icon → Quit) and reopen it. Just closing the window isn't enough.
+4. The tools appear under the tools (🔨) menu in a new chat. Try:
    - *"What's the weather in Lisbon, and should I cycle to work?"*
    - *"How do I get from Orchard MRT to Changi Airport right now?"*
    - *"When's the next bus at stop 83139?"*
 
+### Common mistakes
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Server fails with `No module named 'httpx'` (or `'mcp'`) | `command` is a Python *outside* the `.venv`: the system `python3`, or the real file the `.venv` Python links to | Use the path ending in `.venv/bin/python` (Windows: `.venv\Scripts\python.exe`) **as-is**. Don't resolve it with `readlink`/`realpath`. |
+| Server fails to start / file not found | Relative paths like `.venv/bin/python` or `server.py`. Claude Desktop doesn't start in your project folder. | Use full absolute paths starting with `/` (or `C:\\` on Windows). |
+| Claude Desktop reports invalid JSON | Single backslashes on Windows, a missing comma between servers, or a trailing comma after the last item | Use `\\` in Windows paths, and check commas. Paste the file into a JSON validator if unsure. |
+| No tools appear | Claude Desktop wasn't fully restarted | Quit it completely (⌘Q / tray → Quit) and reopen. |
+| You moved or renamed the project folder | The paths in the config are now wrong | Re-run the Step 1 command and update the config. |
+
+Claude Desktop's own log for this server is `~/Library/Logs/Claude/mcp-server-weather-transit-advisor.log` on macOS (Windows: `%APPDATA%\Claude\logs\`). It shows startup errors such as the ones above. Problems *inside* the tools go to this project's own log; see [Logging](#logging).
+
+> **Alternative:** instead of `python` + `server.py`, `command` can be the installed launcher alone (`/Users/alex/mcp-weather-advisor/.venv/bin/mcp-weather-advisor`, Windows `...\\.venv\\Scripts\\mcp-weather-advisor.exe`) with no `args`. Both start the same server.
+
 ## Project layout
 
 ```
-mcp_weather_advisor/
-    __init__.py      version number
-    __main__.py      enables `python -m mcp_weather_advisor`
-    server.py        the server: config, cache, logging, helpers, the four tools
-server.py            convenience launcher for `python server.py`
-pyproject.toml       packaging: dependencies, the `mcp-weather-advisor` command
-tests/               the pytest suite
+mcp-weather-advisor/
+├── server.py                 ← the file Claude Desktop runs (a small launcher)
+├── mcp_weather_advisor/      ← the server package
+│   ├── __init__.py           version number
+│   ├── __main__.py           enables `python -m mcp_weather_advisor`
+│   └── server.py             the server: settings, logging, cache, helpers, the four tools
+├── tests/                    pytest suite (fake APIs; no internet needed)
+│   ├── conftest.py           fixtures: starts the server over stdio
+│   ├── fake_api.py           local stand-in for Open-Meteo / Transitous / LTA
+│   ├── sample_data.py        realistic API responses for the tests
+│   └── test_*.py             the tests (see Testing)
+├── pyproject.toml            packaging: dependencies, `mcp-weather-advisor` command, pytest settings
+├── requirements.txt          shortcut for `pip install -e .`
+├── requirements-dev.txt      shortcut for `pip install -e ".[dev]"`
+├── README.md
+├── LICENSE                   MIT
+└── .venv/                    your virtual environment (created by you, not in git)
 ```
 
 `mcp_weather_advisor/server.py` is organised in labelled sections: settings, logging, cache, helpers, the four tools (decorated with `@mcp.tool()`) and the entry point. Each tool's docstring is what Claude reads to decide when to use it.
@@ -195,8 +285,8 @@ The suite (~255 tests, about 90 seconds) needs no internet and no API keys:
 
 ## Troubleshooting
 
-- **Server doesn't appear in Claude:** check the paths are absolute and the JSON is valid, then fully restart Claude Desktop.
-- **`ModuleNotFoundError`:** run `pip install -e .` in the environment you're using, and point Claude Desktop at that environment's `mcp-weather-advisor`.
+- **Server doesn't appear in Claude:** see [Common mistakes](#common-mistakes).
+- **`ModuleNotFoundError`:** run `pip install -e .` with the `.venv` activated, and make sure `command` is that `.venv`'s Python (see [Common mistakes](#common-mistakes)).
 - **`mcp-weather-advisor: command not found`:** the environment's `bin` (or `Scripts`) folder isn't on your `PATH`. Activate the virtual environment, or use the full path.
 - **"No location found":** try a larger nearby city or add the country.
 - **"No public-transport route found":** the region may not publish open transit data on Transitous.
