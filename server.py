@@ -23,13 +23,18 @@ Run it with:  python server.py
 (Claude Desktop starts it for you - see README.md.)
 """
 
+import contextvars
 import functools
 import inspect
 import json
 import logging
+import logging.handlers
 import os
 import sqlite3
+import sys
 import time
+import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -128,6 +133,97 @@ MODE_NAMES = {
 
 
 # --------------------------------------------------------------------------
+# 1b. Structured logging
+#     Problems are written to mcp_server.log as JSON Lines: one JSON object
+#     per line, easy to read AND easy to search, e.g.
+#       {"ts": "...", "level": "ERROR", "event": "api_timeout",
+#        "tool": "get_current_weather", "call_id": "3f9c1a2b", ...}
+#
+#     IMPORTANT: an MCP stdio server must never print to stdout - stdout
+#     carries the protocol messages to Claude. Logs go to the file only
+#     (or to stderr if the file can't be opened).
+#
+#     WEATHER_ADVISOR_LOG=/path/file.log changes the file; "off" disables.
+# --------------------------------------------------------------------------
+LOG_PATH = os.environ.get(
+    "WEATHER_ADVISOR_LOG", str(Path(__file__).with_name("mcp_server.log")))
+LOG_MAX_BYTES = 1_000_000   # rotate at ~1 MB ...
+LOG_BACKUPS = 3             # ... keeping mcp_server.log.1 to .3
+
+log = logging.getLogger("weather-transit-advisor")
+
+# Which tool call is running right now. Context variables are safe with
+# async code: each concurrent tool call sees its own value.
+_current_call: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "current_call", default={})
+
+# Query parameters whose values must never reach the log.
+_SECRET_WORDS = ("key", "token", "secret", "password")
+
+
+class JsonLinesFormatter(logging.Formatter):
+    """Format each log record as a single line of JSON."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "ts": datetime.fromtimestamp(record.created, timezone.utc)
+                  .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "level": record.levelname,
+            "event": record.getMessage(),
+        }
+        entry.update(getattr(record, "fields", {}))
+        if record.exc_info:
+            entry["traceback"] = "".join(
+                traceback.format_exception(*record.exc_info)).strip()
+        # default=str: anything not JSON-friendly is written as text.
+        return json.dumps(entry, ensure_ascii=False, default=str)
+
+
+def _setup_logging(path: str = LOG_PATH, max_bytes: int = LOG_MAX_BYTES,
+                   backups: int = LOG_BACKUPS) -> None:
+    """Attach the JSON log file to our logger. Never raises."""
+    for old in list(log.handlers):  # allow calling again (tests)
+        log.removeHandler(old)
+        old.close()
+    log.setLevel(logging.INFO)
+    log.propagate = False         # keep our records out of MCP's console log
+    logging.raiseExceptions = False  # a logging failure must never crash us
+
+    if path.lower() == "off":
+        log.addHandler(logging.NullHandler())
+        return
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8")
+    except OSError as err:
+        # Can't write the file (missing folder, read-only disk...):
+        # fall back to stderr, which is safe for stdio servers.
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(JsonLinesFormatter())
+        log.addHandler(handler)
+        _log_event(logging.WARNING, "log_file_unavailable",
+                   path=path, error=str(err))
+        return
+    handler.setFormatter(JsonLinesFormatter())
+    log.addHandler(handler)
+
+
+def _log_event(level: int, event: str, exc_info=False, **fields) -> None:
+    """Write one structured record, tagged with the current tool call."""
+    fields = {**_current_call.get(), **fields}
+    log.log(level, event, exc_info=exc_info, extra={"fields": fields})
+
+
+def _safe_params(params: dict) -> dict:
+    """Copy of query parameters with anything secret-looking redacted."""
+    return {k: ("[redacted]" if any(w in k.lower() for w in _SECRET_WORDS)
+                else v) for k, v in params.items()}
+
+
+_setup_logging()
+
+
+# --------------------------------------------------------------------------
 # 2a. SQLite cache
 #     A tiny key -> JSON store. The key is the URL plus its query
 #     parameters, so the same question always maps to the same row.
@@ -135,12 +231,13 @@ MODE_NAMES = {
 #     cache miss, so the cache can never break a tool.
 # --------------------------------------------------------------------------
 _cache_db: sqlite3.Connection | None = None
+_cache_broken = False  # set after a failed open, so we log it only once
 
 
 def _cache() -> sqlite3.Connection | None:
     """Open (once) and return the cache database, or None if disabled."""
-    global _cache_db
-    if CACHE_PATH.lower() == "off":
+    global _cache_db, _cache_broken
+    if CACHE_PATH.lower() == "off" or _cache_broken:
         return None
     if _cache_db is None:
         try:
@@ -153,8 +250,10 @@ def _cache() -> sqlite3.Connection | None:
                 " expires_at REAL NOT NULL)"   # when it stops being valid
             )
             _cache_db.commit()
-        except sqlite3.Error:
-            _cache_db = None
+        except sqlite3.Error as err:
+            _log_event(logging.WARNING, "cache_unavailable",
+                       path=CACHE_PATH, error=str(err))
+            _cache_db, _cache_broken = None, True
     return _cache_db
 
 
@@ -175,13 +274,16 @@ def _cache_read(key: str):
             "WHERE key = ? AND expires_at > ?",
             (key, time.time()),
         ).fetchone()
-    except sqlite3.Error:
+    except sqlite3.Error as err:
+        _log_event(logging.WARNING, "cache_error", op="read", error=str(err))
         return None
     if row is None:
         return None
     try:
         return json.loads(row[0]), time.time() - row[1]
     except ValueError:  # damaged row: ignore it and fetch again
+        _log_event(logging.WARNING, "cache_error", op="read",
+                   error="stored entry is not valid JSON", key=key)
         return None
 
 
@@ -198,8 +300,8 @@ def _cache_write(key: str, data, ttl: float) -> None:
         )
         db.execute("DELETE FROM responses WHERE expires_at <= ?", (now,))
         db.commit()
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as err:
+        _log_event(logging.WARNING, "cache_error", op="write", error=str(err))
 
 
 # --------------------------------------------------------------------------
@@ -228,12 +330,47 @@ async def _fetch_json(
         if hit is not None:
             return hit
 
-    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-        response = await client.get(
-            url, params=params, headers={**HEADERS, **(headers or {})}
-        )
-        response.raise_for_status()  # turns HTTP 4xx/5xx into exceptions
+    # Every network failure is logged HERE (where the URL and timing are
+    # known) and then re-raised; the tool's friendly_errors wrapper turns
+    # it into a readable message for Claude. Headers are never logged, so
+    # API keys stay out of the log.
+    where = {"url": url, "params": _safe_params(params)}
+    started = time.monotonic()
+
+    def elapsed_ms() -> int:
+        return round((time.monotonic() - started) * 1000)
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+            response = await client.get(
+                url, params=params, headers={**HEADERS, **(headers or {})}
+            )
+            response.raise_for_status()  # turns HTTP 4xx/5xx into exceptions
+    except httpx.TimeoutException as err:
+        _log_event(logging.ERROR, "api_timeout", **where,
+                   timeout_s=TIMEOUT_SECONDS, elapsed_ms=elapsed_ms(),
+                   error=type(err).__name__)
+        raise
+    except httpx.HTTPStatusError as err:
+        _log_event(logging.ERROR, "api_http_error", **where,
+                   status=err.response.status_code, elapsed_ms=elapsed_ms(),
+                   body_snippet=err.response.text[:200])
+        raise
+    except httpx.HTTPError as err:
+        _log_event(logging.ERROR, "api_unreachable", **where,
+                   elapsed_ms=elapsed_ms(), error=type(err).__name__,
+                   detail=str(err))
+        raise
+
+    try:
         data = response.json()
+    except ValueError as err:
+        _log_event(logging.ERROR, "api_invalid_json", **where,
+                   status=response.status_code,
+                   content_type=response.headers.get("content-type"),
+                   body_snippet=response.text[:200], error=str(err))
+        raise BadResponse("the service sent a response that isn't "
+                          "valid JSON.") from err
 
     if ttl and (cache_if is None or cache_if(data)):
         _cache_write(key, data, ttl)
@@ -252,37 +389,70 @@ def _has(key: str, kind: type):
         data.get(key), kind)
 
 
-def _non_empty_list(data) -> bool:
-    return isinstance(data, list) and len(data) > 0
-
-
 # --------------------------------------------------------------------------
 # 2c. Input checks and friendly error messages
 # --------------------------------------------------------------------------
-log = logging.getLogger("weather-transit-advisor")
-
 MAX_INPUT_LENGTH = 200
 
 
 class LookupFailed(ValueError):
-    """A problem we explain to the user as-is (bad input, no match)."""
+    """A problem we explain to the user as-is (bad input, no match).
+    Already logged where it was raised."""
+
+
+class BadResponse(Exception):
+    """An API answered, but with something unusable (not JSON, impossible
+    coordinates...). Already logged where it was raised."""
 
 
 def _require(value: str, what: str) -> str:
     """Strip `value`; reject it if blank or absurdly long."""
     value = value.strip()
+    problem = None
     if not value:
-        raise LookupFailed(f"Please provide {what}.")
-    if len(value) > MAX_INPUT_LENGTH:
-        raise LookupFailed(
-            f"That {what.split()[-1]} is too long "
-            f"(max {MAX_INPUT_LENGTH} characters).")
+        problem = f"Please provide {what}."
+    elif len(value) > MAX_INPUT_LENGTH:
+        problem = (f"That {what.split()[-1]} is too long "
+                   f"(max {MAX_INPUT_LENGTH} characters).")
+    if problem:
+        _log_event(logging.WARNING, "invalid_input", field=what,
+                   length=len(value), reason=problem)
+        raise LookupFailed(problem)
     return value
+
+
+def _valid_latlon(lat, lon) -> bool:
+    """True if lat/lon are real numbers within Earth's ranges."""
+    is_number = all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in (lat, lon))
+    return is_number and -90 <= lat <= 90 and -180 <= lon <= 180
+
+
+def _all_have_coordinates(results, lat_key: str, lon_key: str) -> bool:
+    """cache_if helper: a non-empty list of places, all with valid lat/lon,
+    so a broken geocoder answer is never cached for days."""
+    return (isinstance(results, list) and len(results) > 0 and all(
+        isinstance(r, dict) and _valid_latlon(r.get(lat_key), r.get(lon_key))
+        for r in results))
+
+
+def _check_coordinates(place: dict, lat_key: str, lon_key: str,
+                       service: str, query: str) -> tuple[float, float]:
+    """Return (lat, lon) if they are real numbers on Earth; otherwise log
+    the bad record and raise BadResponse."""
+    lat, lon = place.get(lat_key), place.get(lon_key)
+    if not _valid_latlon(lat, lon):
+        _log_event(logging.ERROR, "bad_coordinates", service=service,
+                   query=query, latitude=lat, longitude=lon,
+                   place_name=place.get("name"))
+        raise BadResponse(f"the location service returned invalid "
+                          f"coordinates for '{query}'.")
+    return lat, lon
 
 
 def _describe_error(err: Exception) -> str:
     """Turn any failure into one short, human-readable sentence."""
-    if isinstance(err, LookupFailed):
+    if isinstance(err, (LookupFailed, BadResponse)):
         return str(err)
     if isinstance(err, httpx.TimeoutException):
         return (f"the service did not respond within {TIMEOUT_SECONDS:g} "
@@ -294,23 +464,33 @@ def _describe_error(err: Exception) -> str:
         return f"the service returned HTTP {code} {reason}{hint}."
     if isinstance(err, httpx.HTTPError):
         return f"could not reach the service ({type(err).__name__})."
-    if isinstance(err, ValueError):  # body wasn't valid JSON
-        return "the service sent a response that isn't valid JSON."
-    # KeyError/TypeError/...: valid JSON, but not the shape we expected.
-    return "the service sent data in an unexpected format."
+    if isinstance(err, SHAPE_ERRORS):
+        # Valid JSON, but not the shape we expected.
+        return "the service sent data in an unexpected format."
+    return "an unexpected internal error occurred (details in the log)."
 
 
-# Failures every tool turns into a message instead of crashing.
-EXPECTED_ERRORS = (httpx.HTTPError, ValueError, KeyError, TypeError,
-                   AttributeError, IndexError)
+# Errors that mean "the API's JSON wasn't shaped as expected".
+SHAPE_ERRORS = (KeyError, TypeError, AttributeError, IndexError, ValueError)
+
+# Errors already logged at the point they were raised.
+ALREADY_LOGGED = (LookupFailed, BadResponse, httpx.HTTPError)
+
+
+def _shorten(value, limit: int = 60):
+    """Truncate long strings so huge inputs aren't echoed or logged."""
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + "..."
+    return value
 
 
 def friendly_errors(message: str):
-    """Decorator: if a tool fails, return "<message>: <reason>" instead of
-    raising. `message` may use the tool's arguments, e.g. "{place}".
+    """Decorator: a tool that fails returns "<message>: <reason>" instead
+    of raising, so one bad API answer can never break the conversation
+    with Claude. `message` may use the tool's arguments, e.g. "{place}".
 
-    Unexpected-format errors are also logged (with traceback) to stderr,
-    which Claude Desktop saves in its MCP log files.
+    Every failure is logged: network/lookup problems where they happen,
+    and anything else here, with its traceback.
     """
     def decorate(tool):
         signature = inspect.signature(tool)
@@ -318,18 +498,32 @@ def friendly_errors(message: str):
         @functools.wraps(tool)
         async def wrapper(*args, **kwargs):
             try:
-                return await tool(*args, **kwargs)
-            except EXPECTED_ERRORS as err:
-                if not isinstance(err, (LookupFailed, httpx.HTTPError)):
-                    log.exception("%s failed", tool.__name__)
                 bound = signature.bind(*args, **kwargs)
                 bound.apply_defaults()
-                # Don't echo huge inputs back in full.
-                shown = {k: (v[:60] + "..." if isinstance(v, str)
-                             and len(v) > 60 else v)
-                         for k, v in bound.arguments.items()}
-                prefix = message.format(**shown)
+                arguments = bound.arguments
+            except TypeError:  # MCP validates arguments, but be safe
+                arguments = dict(kwargs)
+            shown = {k: _shorten(v) for k, v in arguments.items()}
+            # Tag every log record made during this call.
+            token = _current_call.set(
+                {"tool": tool.__name__, "call_id": uuid.uuid4().hex[:8]})
+            try:
+                return await tool(*args, **kwargs)
+            except Exception as err:  # noqa: BLE001 - never crash the tool
+                if not isinstance(err, ALREADY_LOGGED):
+                    shape = isinstance(err, SHAPE_ERRORS)
+                    _log_event(
+                        logging.ERROR,
+                        "api_bad_shape" if shape else "tool_crashed",
+                        exc_info=True, error=type(err).__name__,
+                        detail=str(err), arguments=shown)
+                try:
+                    prefix = message.format(**shown)
+                except (KeyError, IndexError):
+                    prefix = f"{tool.__name__} failed"
                 return f"{prefix}: {_describe_error(err)}"
+            finally:
+                _current_call.reset(token)
         return wrapper
     return decorate
 
@@ -356,17 +550,26 @@ def _is_future(iso_string: str) -> bool:
 
 
 async def _find_place(name: str) -> dict:
-    """Look up a CITY/TOWN name with Open-Meteo. Raises LookupFailed if none."""
+    """Look up a CITY/TOWN name with Open-Meteo.
+
+    Returns the best match, with coordinates checked. Raises LookupFailed
+    if nothing matches, BadResponse if the coordinates are unusable.
+    """
     data = await _get_json(
         GEOCODING_URL,
         {"name": _normalise(name), "count": 1, "language": "en"},
         ttl=GEOCODE_TTL,
-        cache_if=lambda d: _has("results", list)(d) and bool(d["results"]),
+        cache_if=lambda d: isinstance(d, dict) and _all_have_coordinates(
+            d.get("results"), "latitude", "longitude"),
     )
     results = data.get("results")
     if not results:
+        _log_event(logging.WARNING, "location_not_found",
+                   service="open-meteo", query=name)
         raise LookupFailed(
             f"No location found for '{name}'. Try a nearby city.")
+    _check_coordinates(results[0], "latitude", "longitude",
+                       "open-meteo", name)
     return results[0]
 
 
@@ -375,22 +578,26 @@ async def _find_transit_place(text: str, stops_only: bool = False) -> dict:
 
     Returns a dict with 'name', 'lat', 'lon', 'type' and, for stops, 'id'.
     With stops_only=True, returns the best match that is a transit stop.
-    Raises LookupFailed if nothing suitable is found.
+    Raises LookupFailed if nothing suitable is found, BadResponse if the
+    coordinates are unusable.
     """
     results = await _get_json(
         f"{TRANSITOUS_URL}/v1/geocode",
         {"text": _normalise(text)},
         ttl=GEOCODE_TTL,
-        cache_if=_non_empty_list,
+        cache_if=lambda d: _all_have_coordinates(d, "lat", "lon"),
     )
     if stops_only:
         results = [r for r in results if r.get("type") == "STOP"]
     if not results:
         kind = "transit stop" if stops_only else "place"
+        _log_event(logging.WARNING, "location_not_found",
+                   service="transitous", query=text, wanted=kind)
         raise LookupFailed(
             f"No {kind} found for '{text}'. Add the city, e.g. "
             f"'{text}, Singapore'."
         )
+    _check_coordinates(results[0], "lat", "lon", "transitous", text)
     return results[0]
 
 
@@ -761,5 +968,21 @@ def _format_lta_arrivals(stop: str, data: dict, limit: int) -> str:
 # 4. Start the server. "stdio" means Claude talks to it through the
 #    program's input/output, which is how Claude Desktop launches servers.
 # --------------------------------------------------------------------------
+def main() -> None:
+    _log_event(logging.INFO, "server_start", pid=os.getpid(),
+               python=sys.version.split()[0], cache=CACHE_PATH,
+               lta_key_configured=bool(LTA_ACCOUNT_KEY))
+    try:
+        mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        pass  # Ctrl+C: a normal way to stop the server
+    except Exception:
+        # Something broke the server itself (not a single tool call).
+        _log_event(logging.CRITICAL, "server_crashed", exc_info=True)
+        raise
+    finally:
+        _log_event(logging.INFO, "server_stop", pid=os.getpid())
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    main()

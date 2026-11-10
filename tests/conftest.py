@@ -19,8 +19,12 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-import fake_api as fa
-import sample_data as sd
+# In-process imports of server.py (test_helpers) must not write a log
+# file into the project folder. Set before server.py is first imported.
+os.environ.setdefault("WEATHER_ADVISOR_LOG", "off")
+
+import fake_api as fa  # noqa: E402
+import sample_data as sd  # noqa: E402
 
 SERVER = Path(__file__).resolve().parent.parent / "server.py"
 
@@ -79,6 +83,8 @@ def server_env(_shared_api, tmp_path_factory) -> dict:
         "LTA_ACCOUNT_KEY": "",
         "WEATHER_ADVISOR_CACHE": "off",
         "WEATHER_ADVISOR_TIMEOUT": "1",
+        "WEATHER_ADVISOR_LOG": str(
+            tmp_path_factory.mktemp("logs") / "mcp_server.log"),
     }
 
 

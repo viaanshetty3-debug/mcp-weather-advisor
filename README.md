@@ -110,6 +110,42 @@ mcp dev server.py
 
 `server.py` is organised in four labelled sections: server creation, helper functions, the four tools (decorated with `@mcp.tool()`), and the entry point. Each tool's docstring is what Claude reads to decide when to use it.
 
+## Logging
+
+Problems are written to `mcp_server.log` (next to `server.py`) as JSON Lines, one JSON object per line:
+
+```json
+{"ts": "2026-11-10T03:29:38.790Z", "level": "ERROR", "event": "api_timeout", "tool": "get_current_weather", "call_id": "27efa384", "url": "https://geocoding-api.open-meteo.com/v1/search", "params": {"name": "tokyo", "count": 1, "language": "en"}, "timeout_s": 20.0, "elapsed_ms": 20004, "error": "ReadTimeout"}
+```
+
+Every record has `ts` (UTC), `level` and `event`. Records made during a tool call also carry `tool` and a `call_id`, so you can group everything from one call.
+
+| Event | Level | When |
+|-------|-------|------|
+| `api_timeout` | ERROR | An API didn't answer within the timeout |
+| `api_http_error` | ERROR | An API returned HTTP 4xx/5xx (includes `status` and the first 200 characters of the body) |
+| `api_unreachable` | ERROR | Connection failed (DNS, refused, network down) |
+| `api_invalid_json` | ERROR | An API answered with something that isn't JSON |
+| `api_bad_shape` | ERROR | Valid JSON, but missing expected fields (includes a traceback) |
+| `bad_coordinates` | ERROR | A geocoder returned missing or impossible latitude/longitude |
+| `location_not_found` | WARNING | No place/stop matched the query |
+| `invalid_input` | WARNING | Blank or overlong input |
+| `cache_unavailable` / `cache_error` | WARNING | The cache file couldn't be opened, read or written |
+| `tool_crashed` | ERROR | Any other unexpected exception (includes a traceback) |
+| `server_start` / `server_stop` | INFO | Server lifecycle |
+
+- **Nothing is ever printed to stdout.** stdout carries the MCP protocol, and the test suite checks it stays clean while every failure type is logged.
+- **No failure crashes a tool.** Every one becomes a readable message for Claude, such as *"Could not get weather for 'Tokyo': the service did not respond within 20 seconds."*
+- **The log rotates** at about 1 MB, keeping `mcp_server.log.1` to `.3`.
+- **API keys are never logged.** Request headers are not recorded, and query parameters with names like `key`, `token` or `secret` are redacted.
+- `WEATHER_ADVISOR_LOG=/path/to/file.log` moves the log; `WEATHER_ADVISOR_LOG=off` disables it. If the file can't be opened, log lines go to stderr instead, which Claude Desktop saves in its own MCP logs.
+- `WEATHER_ADVISOR_TIMEOUT` sets the network timeout in seconds (default 20).
+
+Quick look at recent errors (needs `jq`):
+```bash
+jq -c 'select(.level != "INFO") | {ts, event, tool, error, status}' mcp_server.log
+```
+
 ## Testing
 
 ```bash
@@ -117,7 +153,7 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The suite (~210 tests, about a minute) needs no internet and no API keys:
+The suite (~240 tests, about 80 seconds) needs no internet and no API keys:
 
 - **Over stdio, like Claude Desktop:** almost every test starts the real `server.py` as a subprocess and calls its tools with the official MCP client.
 - **Against a local fake API:** each test scripts the fake's replies, via the environment variables `OPEN_METEO_GEOCODING_URL`, `OPEN_METEO_FORECAST_URL`, `TRANSITOUS_URL` and `LTA_BUS_ARRIVAL_URL`.
@@ -130,6 +166,7 @@ The suite (~210 tests, about a minute) needs no internet and no API keys:
 | `tests/test_departures.py` | Stop codes vs names, limit clamping, LTA live arrivals, LTA auth/rate-limit errors |
 | `tests/test_api_failures.py` | Every tool × every upstream API returning HTTP 4xx/5xx, HTML, invalid JSON, empty bodies, wrong JSON shapes, timeouts, or being unreachable |
 | `tests/test_cache.py` | Cache hits, TTLs, expiry, departed-trip refresh, restart persistence, corrupt/unwritable cache files, keys never stored |
+| `tests/test_logging.py` | Every failure type writes one valid JSON log record with the right fields; raw stdout stays pure JSON-RPC; key redaction, rotation, unwritable/disabled log |
 | `tests/test_helpers.py` | Fast in-process unit tests of weather thresholds, time conversion and cache primitives |
 
 ## Troubleshooting

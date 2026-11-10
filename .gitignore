@@ -8,3 +8,4 @@ ENV/
 .DS_Store
 cache.sqlite3*
 .pytest_cache/
+mcp_server.log*
