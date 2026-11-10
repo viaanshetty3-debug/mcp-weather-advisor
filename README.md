@@ -1,5 +1,7 @@
 # MCP Weather & Transit Advisor
 
+[![Tests](https://github.com/<your-username>/mcp-weather-advisor/actions/workflows/tests.yml/badge.svg)](https://github.com/<your-username>/mcp-weather-advisor/actions/workflows/tests.yml)
+
 A small [Model Context Protocol](https://modelcontextprotocol.io) server that lets Claude check real-time weather and plan real public-transport trips, then recommend a route that suits the weather.
 
 ## Tools
@@ -282,6 +284,18 @@ The suite (~255 tests, about 90 seconds) needs no internet and no API keys:
 | `tests/test_logging.py` | Every failure type writes one valid JSON log record with the right fields; raw stdout stays pure JSON-RPC; key redaction, rotation, unwritable/disabled log |
 | `tests/test_packaging.py` | Package metadata, the `mcp-weather-advisor` command, `python -m` and `python server.py` launch, running from any folder, default file locations |
 | `tests/test_helpers.py` | Fast in-process unit tests of weather thresholds, time conversion and cache primitives |
+
+### Continuous integration
+
+`.github/workflows/tests.yml` runs the whole suite on GitHub Actions for every push and pull request (and on demand from the **Actions** tab), on **Python 3.11 and 3.12** on Ubuntu. Each run:
+
+1. installs the package with `pip install -e ".[dev]"`, exactly as a developer would;
+2. runs the **SQLite cache tests** (`tests/test_cache.py`) as their own step;
+3. runs **everything else**: the MCP stdio tool tests, API-failure handling, logging, packaging and unit tests. This step runs even if the cache step failed, so all problems show up in one run.
+
+If anything fails, the run keeps a downloadable artifact with JUnit reports plus each test's server stderr and `mcp_server.log`. No secrets are needed: the tests use a local fake API.
+
+Replace `<your-username>` in the badge at the top of this README once the repository is on GitHub.
 
 ## Troubleshooting
 
