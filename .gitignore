@@ -7,3 +7,4 @@ ENV/
 .env
 .DS_Store
 cache.sqlite3*
+.pytest_cache/

@@ -23,7 +23,10 @@ Run it with:  python server.py
 (Claude Desktop starts it for you - see README.md.)
 """
 
+import functools
+import inspect
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -39,22 +42,30 @@ from mcp.server.mcpserver import MCPServer
 # --------------------------------------------------------------------------
 mcp = MCPServer("weather-transit-advisor")
 
+# API endpoints. Each can be overridden with an environment variable, which
+# the test suite uses to point the server at a local fake API.
+
 # Open-Meteo endpoints (free, no key required).
-GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+GEOCODING_URL = os.environ.get(
+    "OPEN_METEO_GEOCODING_URL", "https://geocoding-api.open-meteo.com/v1/search")
+FORECAST_URL = os.environ.get(
+    "OPEN_METEO_FORECAST_URL", "https://api.open-meteo.com/v1/forecast")
 
 # Transitous endpoints (free, no key required).
-TRANSITOUS_URL = "https://api.transitous.org/api"
+TRANSITOUS_URL = os.environ.get(
+    "TRANSITOUS_URL", "https://api.transitous.org/api")
 
 # LTA DataMall bus arrivals (Singapore). Only used if a key is configured.
-LTA_BUS_ARRIVAL_URL = "https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival"
+LTA_BUS_ARRIVAL_URL = os.environ.get(
+    "LTA_BUS_ARRIVAL_URL",
+    "https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival")
 LTA_ACCOUNT_KEY = os.environ.get("LTA_ACCOUNT_KEY", "").strip()
 
 # Transitous asks API users to send a descriptive User-Agent.
 HEADERS = {"User-Agent": "mcp-weather-transit-advisor/0.2"}
 
 # Never wait forever on a network call.
-TIMEOUT_SECONDS = 20.0
+TIMEOUT_SECONDS = float(os.environ.get("WEATHER_ADVISOR_TIMEOUT", "20"))
 
 # How many trip options to show. We ask the router for a few more so that a
 # cached plan still has options left after already-departed trips are removed.
@@ -168,7 +179,10 @@ def _cache_read(key: str):
         return None
     if row is None:
         return None
-    return json.loads(row[0]), time.time() - row[1]
+    try:
+        return json.loads(row[0]), time.time() - row[1]
+    except ValueError:  # damaged row: ignore it and fetch again
+        return None
 
 
 def _cache_write(key: str, data, ttl: float) -> None:
@@ -197,11 +211,15 @@ async def _fetch_json(
     headers: dict | None = None,
     ttl: float = 0,
     fresh: bool = False,
+    cache_if=None,
 ):
     """Call an API (or the cache) and return (data, age_in_seconds).
 
-    ttl:   seconds to keep the answer in the cache (0 = don't cache).
-    fresh: True skips the cache read and always calls the API.
+    ttl:      seconds to keep the answer in the cache (0 = don't cache).
+    fresh:    True skips the cache read and always calls the API.
+    cache_if: optional check, cache_if(data) -> bool. Answers that fail it
+              (empty results, unexpected shapes) are returned but NOT
+              cached, so one bad answer isn't repeated for the whole TTL.
     age is 0 for a brand-new answer.
     """
     key = _cache_key(url, params)
@@ -217,7 +235,7 @@ async def _fetch_json(
         response.raise_for_status()  # turns HTTP 4xx/5xx into exceptions
         data = response.json()
 
-    if ttl:
+    if ttl and (cache_if is None or cache_if(data)):
         _cache_write(key, data, ttl)
     return data, 0.0
 
@@ -226,6 +244,94 @@ async def _get_json(url: str, params: dict, **kwargs):
     """Like _fetch_json, but returns only the data."""
     data, _age = await _fetch_json(url, params, **kwargs)
     return data
+
+
+def _has(key: str, kind: type):
+    """Build a cache_if check: 'data is a dict whose `key` is a `kind`'."""
+    return lambda data: isinstance(data, dict) and isinstance(
+        data.get(key), kind)
+
+
+def _non_empty_list(data) -> bool:
+    return isinstance(data, list) and len(data) > 0
+
+
+# --------------------------------------------------------------------------
+# 2c. Input checks and friendly error messages
+# --------------------------------------------------------------------------
+log = logging.getLogger("weather-transit-advisor")
+
+MAX_INPUT_LENGTH = 200
+
+
+class LookupFailed(ValueError):
+    """A problem we explain to the user as-is (bad input, no match)."""
+
+
+def _require(value: str, what: str) -> str:
+    """Strip `value`; reject it if blank or absurdly long."""
+    value = value.strip()
+    if not value:
+        raise LookupFailed(f"Please provide {what}.")
+    if len(value) > MAX_INPUT_LENGTH:
+        raise LookupFailed(
+            f"That {what.split()[-1]} is too long "
+            f"(max {MAX_INPUT_LENGTH} characters).")
+    return value
+
+
+def _describe_error(err: Exception) -> str:
+    """Turn any failure into one short, human-readable sentence."""
+    if isinstance(err, LookupFailed):
+        return str(err)
+    if isinstance(err, httpx.TimeoutException):
+        return (f"the service did not respond within {TIMEOUT_SECONDS:g} "
+                f"seconds. Please try again shortly.")
+    if isinstance(err, httpx.HTTPStatusError):
+        code = err.response.status_code
+        reason = err.response.reason_phrase or "error"
+        hint = " (rate limited - wait a minute)" if code == 429 else ""
+        return f"the service returned HTTP {code} {reason}{hint}."
+    if isinstance(err, httpx.HTTPError):
+        return f"could not reach the service ({type(err).__name__})."
+    if isinstance(err, ValueError):  # body wasn't valid JSON
+        return "the service sent a response that isn't valid JSON."
+    # KeyError/TypeError/...: valid JSON, but not the shape we expected.
+    return "the service sent data in an unexpected format."
+
+
+# Failures every tool turns into a message instead of crashing.
+EXPECTED_ERRORS = (httpx.HTTPError, ValueError, KeyError, TypeError,
+                   AttributeError, IndexError)
+
+
+def friendly_errors(message: str):
+    """Decorator: if a tool fails, return "<message>: <reason>" instead of
+    raising. `message` may use the tool's arguments, e.g. "{place}".
+
+    Unexpected-format errors are also logged (with traceback) to stderr,
+    which Claude Desktop saves in its MCP log files.
+    """
+    def decorate(tool):
+        signature = inspect.signature(tool)
+
+        @functools.wraps(tool)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await tool(*args, **kwargs)
+            except EXPECTED_ERRORS as err:
+                if not isinstance(err, (LookupFailed, httpx.HTTPError)):
+                    log.exception("%s failed", tool.__name__)
+                bound = signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                # Don't echo huge inputs back in full.
+                shown = {k: (v[:60] + "..." if isinstance(v, str)
+                             and len(v) > 60 else v)
+                         for k, v in bound.arguments.items()}
+                prefix = message.format(**shown)
+                return f"{prefix}: {_describe_error(err)}"
+        return wrapper
+    return decorate
 
 
 def _normalise(text: str) -> str:
@@ -250,15 +356,17 @@ def _is_future(iso_string: str) -> bool:
 
 
 async def _find_place(name: str) -> dict:
-    """Look up a CITY/TOWN name with Open-Meteo. Raises ValueError if none."""
+    """Look up a CITY/TOWN name with Open-Meteo. Raises LookupFailed if none."""
     data = await _get_json(
         GEOCODING_URL,
         {"name": _normalise(name), "count": 1, "language": "en"},
         ttl=GEOCODE_TTL,
+        cache_if=lambda d: _has("results", list)(d) and bool(d["results"]),
     )
     results = data.get("results")
     if not results:
-        raise ValueError(f"No location found for '{name}'. Try a nearby city.")
+        raise LookupFailed(
+            f"No location found for '{name}'. Try a nearby city.")
     return results[0]
 
 
@@ -267,18 +375,19 @@ async def _find_transit_place(text: str, stops_only: bool = False) -> dict:
 
     Returns a dict with 'name', 'lat', 'lon', 'type' and, for stops, 'id'.
     With stops_only=True, returns the best match that is a transit stop.
-    Raises ValueError if nothing suitable is found.
+    Raises LookupFailed if nothing suitable is found.
     """
     results = await _get_json(
         f"{TRANSITOUS_URL}/v1/geocode",
         {"text": _normalise(text)},
         ttl=GEOCODE_TTL,
+        cache_if=_non_empty_list,
     )
     if stops_only:
         results = [r for r in results if r.get("type") == "STOP"]
     if not results:
         kind = "transit stop" if stops_only else "place"
-        raise ValueError(
+        raise LookupFailed(
             f"No {kind} found for '{text}'. Add the city, e.g. "
             f"'{text}, Singapore'."
         )
@@ -302,6 +411,7 @@ async def _fetch_weather(latitude: float, longitude: float):
             "timezone": "auto",
         },
         ttl=WEATHER_TTL,
+        cache_if=_has("current", dict),
     )
 
 
@@ -405,17 +515,14 @@ def _describe_itinerary(itinerary: dict, tz_name: str | None) -> list[str]:
 #    The docstring is shown to Claude, so it explains WHEN to use the tool.
 # --------------------------------------------------------------------------
 @mcp.tool()
+@friendly_errors("Could not geocode '{place}'")
 async def geocode_location(place: str) -> str:
     """Find the coordinates (latitude/longitude) of a city or town by name.
 
     Args:
         place: A city or town name, e.g. "Singapore" or "Austin".
     """
-    try:
-        found = await _find_place(place)
-    except (ValueError, httpx.HTTPError) as err:
-        return f"Could not geocode '{place}': {err}"
-
+    found = await _find_place(_require(place, "a place name"))
     return (
         f"{_place_label(found)}\n"
         f"Latitude: {found['latitude']}\n"
@@ -425,18 +532,15 @@ async def geocode_location(place: str) -> str:
 
 
 @mcp.tool()
+@friendly_errors("Could not get weather for '{place}'")
 async def get_current_weather(place: str) -> str:
     """Get real-time weather for a city or town by name.
 
     Args:
         place: A city or town name, e.g. "Tokyo".
     """
-    try:
-        found = await _find_place(place)
-        weather, age = await _fetch_weather(
-            found["latitude"], found["longitude"])
-    except (ValueError, httpx.HTTPError) as err:
-        return f"Could not get weather for '{place}': {err}"
+    found = await _find_place(_require(place, "a place name"))
+    weather, age = await _fetch_weather(found["latitude"], found["longitude"])
 
     now = weather["current"]
     units = weather["current_units"]
@@ -457,6 +561,7 @@ async def get_current_weather(place: str) -> str:
 
 
 @mcp.tool()
+@friendly_errors("Could not plan a trip from '{origin}' to '{destination}'")
 async def get_commute_advice(origin: str, destination: str) -> str:
     """Plan a public-transport trip leaving now, using real timetables,
     and recommend an option based on the current weather.
@@ -469,29 +574,31 @@ async def get_commute_advice(origin: str, destination: str) -> str:
             e.g. "Orchard MRT, Singapore".
         destination: Where you are going, e.g. "Changi Airport".
     """
-    try:
-        start = await _find_transit_place(origin)
-        end = await _find_transit_place(destination)
-        weather, weather_age = await _fetch_weather(start["lat"], start["lon"])
+    origin = _require(origin, "a starting point")
+    destination = _require(destination, "a destination")
+    start = await _find_transit_place(origin)
+    end = await _find_transit_place(destination)
+    weather, weather_age = await _fetch_weather(start["lat"], start["lon"])
 
-        plan_params = {
-            "fromPlace": f"{start['lat']},{start['lon']}",
-            "toPlace": f"{end['lat']},{end['lon']}",
-            "numItineraries": ITINERARIES_TO_FETCH,
-        }
+    plan_url = f"{TRANSITOUS_URL}/v5/plan"
+    plan_params = {
+        "fromPlace": f"{start['lat']},{start['lon']}",
+        "toPlace": f"{end['lat']},{end['lon']}",
+        "numItineraries": ITINERARIES_TO_FETCH,
+    }
+    is_plan = _has("itineraries", list)
+    plan, plan_age = await _fetch_json(
+        plan_url, plan_params, ttl=TRANSIT_TTL, cache_if=is_plan)
+    # Never offer trips that have already left (possible with cached plans).
+    upcoming = [it for it in plan.get("itineraries", [])
+                if _is_future(it["startTime"])]
+    if plan_age and not upcoming:
+        # Every cached trip has departed: ask the router again.
         plan, plan_age = await _fetch_json(
-            f"{TRANSITOUS_URL}/v5/plan", plan_params, ttl=TRANSIT_TTL)
-        # A cached plan may contain trips that have already left.
+            plan_url, plan_params, ttl=TRANSIT_TTL, fresh=True,
+            cache_if=is_plan)
         upcoming = [it for it in plan.get("itineraries", [])
                     if _is_future(it["startTime"])]
-        if plan_age and not upcoming:
-            # Every cached trip has departed: ask the router again.
-            plan, plan_age = await _fetch_json(
-                f"{TRANSITOUS_URL}/v5/plan", plan_params,
-                ttl=TRANSIT_TTL, fresh=True)
-            upcoming = plan.get("itineraries", [])
-    except (ValueError, httpx.HTTPError) as err:
-        return f"Could not plan a trip from '{origin}' to '{destination}': {err}"
 
     tz_name = weather.get("timezone")
     assessment = _assess_weather(weather["current"])
@@ -539,6 +646,7 @@ async def get_commute_advice(origin: str, destination: str) -> str:
 
 
 @mcp.tool()
+@friendly_errors("Could not get departures for '{stop}'")
 async def get_stop_departures(stop: str, limit: int = 8) -> str:
     """List upcoming buses/trains at a public-transport stop.
 
@@ -551,6 +659,7 @@ async def get_stop_departures(stop: str, limit: int = 8) -> str:
             5-digit bus stop code ("83139").
         limit: Maximum number of departures to list (default 8).
     """
+    stop = _require(stop, "a stop name or code")
     limit = max(1, min(limit, 20))
     is_sg_code = stop.isdigit() and len(stop) == 5
 
@@ -566,29 +675,30 @@ async def get_stop_departures(stop: str, limit: int = 8) -> str:
                 headers={"AccountKey": LTA_ACCOUNT_KEY,
                          "accept": "application/json"},
                 ttl=LIVE_ARRIVALS_TTL,
+                cache_if=_has("Services", list),
             )
         except httpx.HTTPError as err:
-            return f"LTA DataMall request failed for stop {stop}: {err}"
+            return (f"LTA DataMall request failed for stop {stop}: "
+                    f"{_describe_error(err)}")
         return _format_lta_arrivals(stop, data, limit) + _freshness(age)
 
     # --- Timetable path: Transitous ---------------------------------------
-    try:
-        if is_sg_code:
-            stop_id = f"sg-LTA_{stop}"  # Transitous ID for SG bus stops
-        else:
-            found = await _find_transit_place(stop, stops_only=True)
-            stop_id = found["id"]
-        params = {"stopId": stop_id, "n": DEPARTURES_TO_FETCH}
-        url = f"{TRANSITOUS_URL}/v5/stoptimes"
-        data, age = await _fetch_json(url, params, ttl=TRANSIT_TTL)
+    if is_sg_code:
+        stop_id = f"sg-LTA_{stop}"  # Transitous ID for SG bus stops
+    else:
+        found = await _find_transit_place(stop, stops_only=True)
+        stop_id = found["id"]
+    url = f"{TRANSITOUS_URL}/v5/stoptimes"
+    params = {"stopId": stop_id, "n": DEPARTURES_TO_FETCH}
+    is_stoptimes = _has("stopTimes", list)
+    data, age = await _fetch_json(url, params, ttl=TRANSIT_TTL,
+                                  cache_if=is_stoptimes)
+    stop_times = _upcoming_departures(data)
+    if age and len(stop_times) < limit:
+        # Too many cached departures have already left: refresh.
+        data, age = await _fetch_json(url, params, ttl=TRANSIT_TTL,
+                                      fresh=True, cache_if=is_stoptimes)
         stop_times = _upcoming_departures(data)
-        if age and len(stop_times) < limit:
-            # Too many cached departures have already left: refresh.
-            data, age = await _fetch_json(url, params, ttl=TRANSIT_TTL,
-                                          fresh=True)
-            stop_times = _upcoming_departures(data)
-    except (ValueError, httpx.HTTPError) as err:
-        return f"Could not get departures for '{stop}': {err}"
 
     # Transitous treats 'n' as a target, not a cap, so trim to the limit.
     stop_times = stop_times[:limit]
@@ -608,7 +718,6 @@ async def get_stop_departures(stop: str, limit: int = 8) -> str:
     if is_sg_code:
         lines.append("(Timetabled only. Set LTA_ACCOUNT_KEY for live arrivals.)")
     return "\n".join(lines) + _freshness(age)
-
 
 def _upcoming_departures(data: dict) -> list[dict]:
     """Departures from a Transitous stoptimes answer that haven't left yet."""

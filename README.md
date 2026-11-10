@@ -110,6 +110,28 @@ mcp dev server.py
 
 `server.py` is organised in four labelled sections: server creation, helper functions, the four tools (decorated with `@mcp.tool()`), and the entry point. Each tool's docstring is what Claude reads to decide when to use it.
 
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The suite (~210 tests, about a minute) needs no internet and no API keys:
+
+- **Over stdio, like Claude Desktop:** almost every test starts the real `server.py` as a subprocess and calls its tools with the official MCP client.
+- **Against a local fake API:** each test scripts the fake's replies, via the environment variables `OPEN_METEO_GEOCODING_URL`, `OPEN_METEO_FORECAST_URL`, `TRANSITOUS_URL` and `LTA_BUS_ARRIVAL_URL`.
+
+| File | Covers |
+|------|--------|
+| `tests/test_protocol.py` | Tool discovery, schemas, unknown tools, missing/wrong-type arguments |
+| `tests/test_weather.py` | Weather and geocoding output, unknown/blank/overlong/Unicode places, query-string injection |
+| `tests/test_commute.py` | Trip ranking in good vs bad weather, local times, departed trips, no-route and bad-timezone cases |
+| `tests/test_departures.py` | Stop codes vs names, limit clamping, LTA live arrivals, LTA auth/rate-limit errors |
+| `tests/test_api_failures.py` | Every tool × every upstream API returning HTTP 4xx/5xx, HTML, invalid JSON, empty bodies, wrong JSON shapes, timeouts, or being unreachable |
+| `tests/test_cache.py` | Cache hits, TTLs, expiry, departed-trip refresh, restart persistence, corrupt/unwritable cache files, keys never stored |
+| `tests/test_helpers.py` | Fast in-process unit tests of weather thresholds, time conversion and cache primitives |
+
 ## Troubleshooting
 
 - **Server doesn't appear in Claude:** check the paths are absolute and the JSON is valid, then fully restart Claude Desktop.
