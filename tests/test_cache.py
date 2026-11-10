@@ -227,7 +227,9 @@ async def test_corrupt_cache_file_falls_back_to_api(cached_server, sg_api,
 
 async def test_unwritable_cache_location_falls_back_to_api(
         cached_server, sg_api, tmp_path):
-    bad = tmp_path / "missing-dir" / "cache.sqlite3"
+    blocker = tmp_path / "a-file"   # a FILE where a folder is needed
+    blocker.write_text("")
+    bad = blocker / "cache.sqlite3"
     async with cached_server(WEATHER_ADVISOR_CACHE=str(bad)) as client:
         text = await client.call("get_current_weather", place="Singapore")
     assert "Weather in Singapore" in text

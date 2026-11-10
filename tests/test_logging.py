@@ -19,8 +19,8 @@ from mcp.types import LATEST_PROTOCOL_VERSION
 
 import fake_api as fa
 import sample_data as sd
-import server
-from conftest import SERVER, launch
+from conftest import SERVER_COMMAND, launch
+from mcp_weather_advisor import server
 
 pytestmark = pytest.mark.anyio
 
@@ -274,8 +274,10 @@ async def test_log_disabled(server_env, tmp_path, sg_api):
 async def test_unwritable_log_falls_back_to_stderr(server_env, tmp_path,
                                                    sg_api):
     stderr = tmp_path / "stderr"
+    blocker = tmp_path / "a-file"   # a FILE where a folder is needed
+    blocker.write_text("")
     env = {**server_env,
-           "WEATHER_ADVISOR_LOG": str(tmp_path / "no-such-dir" / "x.log")}
+           "WEATHER_ADVISOR_LOG": str(blocker / "x.log")}
     sg_api.json(fa.FORECAST, {}, status=500)
     async with launch(env, stderr) as client:
         text = await client.call("get_current_weather", place="Singapore")
@@ -377,7 +379,7 @@ def test_stdout_carries_only_protocol_messages(server_env, sg_api, tmp_path):
     log = tmp_path / "mcp_server.log"
     env = {**server_env, "WEATHER_ADVISOR_LOG": str(log)}
     proc = subprocess.Popen(
-        [sys.executable, str(SERVER)], env=env, text=True,
+        SERVER_COMMAND, env=env, text=True,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=open(tmp_path / "stderr", "w"))
     try:

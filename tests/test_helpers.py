@@ -6,7 +6,7 @@ import time
 import pytest
 
 import sample_data as sd
-import server
+from mcp_weather_advisor import server
 
 
 # ---- weather assessment -----------------------------------------------------

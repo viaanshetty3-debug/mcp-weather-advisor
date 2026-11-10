@@ -1,2 +1,2 @@
--r requirements.txt
-pytest>=8
+# Installs this project plus test tools (defined in pyproject.toml).
+-e .[dev]

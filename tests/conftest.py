@@ -26,7 +26,9 @@ os.environ.setdefault("WEATHER_ADVISOR_LOG", "off")
 import fake_api as fa  # noqa: E402
 import sample_data as sd  # noqa: E402
 
-SERVER = Path(__file__).resolve().parent.parent / "server.py"
+REPO = Path(__file__).resolve().parent.parent
+# How tests start the server: as the installed package (`pip install -e .`).
+SERVER_COMMAND = [sys.executable, "-m", "mcp_weather_advisor"]
 
 
 @pytest.fixture(scope="session")
@@ -107,10 +109,14 @@ class Client:
 
 
 @asynccontextmanager
-async def launch(env: dict, log_path: Path):
-    """Start server.py with `env` and yield a connected Client."""
+async def launch(env: dict, log_path: Path, command: list | None = None):
+    """Start the server with `env` and yield a connected Client.
+
+    `command` defaults to SERVER_COMMAND (python -m mcp_weather_advisor).
+    """
+    command = command or SERVER_COMMAND
     params = StdioServerParameters(
-        command=sys.executable, args=[str(SERVER)], env=env)
+        command=command[0], args=command[1:], env=env)
     with open(log_path, "a") as errlog:
         async with stdio_client(params, errlog=errlog) as (read, write):
             async with ClientSession(read, write) as session:

@@ -1,0 +1,58 @@
+# Packaging configuration (PEP 621). Install with:
+#     pip install -e .          # the server and its dependencies
+#     pip install -e ".[dev]"   # ... plus the test tools
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-weather-advisor"
+dynamic = ["version"]   # read from mcp_weather_advisor/__init__.py
+description = "MCP server giving Claude real-time weather, public-transport trip planning and stop departures."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+keywords = ["mcp", "model-context-protocol", "claude", "weather", "transit", "gtfs"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+dependencies = [
+    "mcp>=2.0,<3",     # MCP Python SDK (2.x: MCPServer API)
+    "httpx>=0.27",     # async HTTP client for the weather/transit APIs
+    # Intel Macs only: `mcp` needs `cryptography`, and versions 49+ publish
+    # no pre-built wheel for macOS x86_64, so pip would try (and usually
+    # fail) to compile it from Rust source. 48.x installs cleanly. Remove
+    # this line if cryptography ships Intel Mac wheels again.
+    "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "mcp[cli]>=2.0,<3",   # adds the `mcp dev` command (MCP Inspector)
+]
+
+[project.scripts]
+# Installs a `mcp-weather-advisor` command that starts the stdio server.
+mcp-weather-advisor = "mcp_weather_advisor.server:main"
+
+[tool.setuptools]
+packages = ["mcp_weather_advisor"]
+
+[tool.setuptools.dynamic]
+version = { attr = "mcp_weather_advisor.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-ra"
